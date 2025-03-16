@@ -1,0 +1,1 @@
+Telegram Gemini bot. Change model as needed. Has web search. Accepts image input with or without text, limited to one per message due to how Telegram handles images. Supports multiple concurrent conversations: multiple users and multiple groups (eg. user adds bot to multiple groups to maintain multiple conversations)
