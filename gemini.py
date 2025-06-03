@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 # --- Model/Bot Configuration ---
 
 # System Instructions
-FLASH_SYSTEM_INSTRUCTIONS = """instructions here"""
-PRO_SYSTEM_INSTRUCTIONS = """instructions here"""
+FLASH_SYSTEM_INSTRUCTIONS = """instructions"""
 
+PRO_SYSTEM_INSTRUCTIONS = """instructions"""
 
 @dataclass
 class ModelConfig:
@@ -183,7 +183,7 @@ def query_assistant(user_content: List[types.Part], chat: Any, config: ModelConf
         logger.error(f"Error calling Gemini API ({config.name}): {type(e).__name__} - {e}")
         return f"Error: An exception occurred while contacting the AI ({type(e).__name__}).", chat
 
-# --- Typing Indicator Helper ---
+# --- Typing Indicator ---
 async def keep_typing(context: CallbackContext, chat_id: int, stop_event: asyncio.Event):
     """Sends typing action periodically until stop_event is set."""
     while not stop_event.is_set():
@@ -214,6 +214,7 @@ async def process_final_message(chat_id: int, context: CallbackContext):
             if chat_id in pending_content: del pending_content[chat_id]
         return
 
+    # --- Conversation Setup ---
     convo_state = conversation_threads.get(chat_id)
     chat_instance = None
     current_config = None
@@ -222,8 +223,7 @@ async def process_final_message(chat_id: int, context: CallbackContext):
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         stop_typing_event_setup = asyncio.Event(); typing_task_setup = asyncio.create_task(keep_typing(context, chat_id, stop_typing_event_setup))
         default_chat_instance = None
-        try:
-            default_chat_instance = await asyncio.to_thread(create_gemini_chat, FLASH_CONFIG, DEFAULT_TOOLS)
+        try: default_chat_instance = await asyncio.to_thread(create_gemini_chat, FLASH_CONFIG, DEFAULT_TOOLS)
         except Exception as create_e: logger.error(f"Error creating default Gemini chat ({FLASH_CONFIG.name}) in thread: {create_e}")
         finally: stop_typing_event_setup.set(); await typing_task_setup
         if default_chat_instance:
@@ -241,6 +241,7 @@ async def process_final_message(chat_id: int, context: CallbackContext):
         chat_instance = convo_state.chat
         current_config = convo_state.config
 
+    # --- Log final combined message (user input) ---
     log_display_parts = []
     if user_content_parts:
         for part in user_content_parts:
@@ -260,7 +261,7 @@ async def process_final_message(chat_id: int, context: CallbackContext):
     logger.info(f"Final combined message for chat_id: {chat_id} (using model: {current_config.name}): {user_content_log_display}")
 
 
-    # --- Persistent Typing Indicator ---
+    # --- Persistent Typing Indicator Logic ---
     stop_typing_event = asyncio.Event()
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     typing_task = asyncio.create_task(keep_typing(context, chat_id, stop_typing_event))
@@ -269,7 +270,7 @@ async def process_final_message(chat_id: int, context: CallbackContext):
     gemini_response_parts = []
 
     try:
-        # --- Main Processing ---
+        # --- Main Processing (API Call) ---
         updated_chat = None
         response_object_or_error = None
         try:
@@ -301,25 +302,56 @@ async def process_final_message(chat_id: int, context: CallbackContext):
         # --- Process and Send Each Part Individually ---
         sent_anything_successfully = False
         parts_to_send_to_user = []
-        last_part_was_search_tool_call = False
+        suppress_next_n_code_results = 0
+        last_part_was_python_code = False
 
-        for part_data in gemini_response_parts:
-            is_search_tool_call = False
-            if hasattr(part_data, 'executable_code') and part_data.executable_code and hasattr(part_data.executable_code, 'code'):
-                code = part_data.executable_code.code.strip()
-                if "search(" in code or "google_search(" in code or "concise_search(" in code:
-                    logger.info(f"Detected search tool call, flagging for suppression: {code}")
-                    is_search_tool_call = True
-                    last_part_was_search_tool_call = True
-                    continue
+        # This loop should only run if gemini_response_parts is not empty
+        if gemini_response_parts:
+            for i, part_data in enumerate(gemini_response_parts):
+                is_search_tool_call = False
+                current_part_is_python_code = False
 
-            if last_part_was_search_tool_call and hasattr(part_data, 'code_execution_result'):
-                logger.info("Detected code execution result immediately after search tool call, flagging for suppression.")
-                last_part_was_search_tool_call = False
-                continue
+                if hasattr(part_data, 'executable_code') and part_data.executable_code and hasattr(part_data.executable_code, 'code'):
+                    code = part_data.executable_code.code.strip()
+                    if "search(" in code or "google_search(" in code or "concise_search(" in code:
+                        logger.info(f"Detected search tool call, flagging for suppression: {code}")
+                        is_search_tool_call = True
+                        suppress_next_n_code_results = code.count("search(") + code.count("google_search(") + code.count("concise_search(")
+                        if suppress_next_n_code_results == 0: suppress_next_n_code_results = 1
+                        logger.info(f"Will attempt to suppress next {suppress_next_n_code_results} code_execution_result parts related to search.")
+                        last_part_was_python_code = False
+                        continue
+                    else:
+                        current_part_is_python_code = True
+                        last_part_was_python_code = True
 
-            parts_to_send_to_user.append(part_data)
-            last_part_was_search_tool_call = False
+                if hasattr(part_data, 'code_execution_result'):
+                    output_text_lower = getattr(getattr(part_data, 'code_execution_result', None), 'output', "").strip().lower()
+                    if suppress_next_n_code_results > 0:
+                        if "looking up information" in output_text_lower or "searching google" in output_text_lower:
+                            logger.info(f"Suppressing search tool 'looking up' result. Results to skip remaining: {suppress_next_n_code_results-1}")
+                            suppress_next_n_code_results -= 1
+                            last_part_was_python_code = False
+                            continue
+                        else:
+                            logger.info(f"Suppressing other code_execution_result after search. Results to skip remaining: {suppress_next_n_code_results-1}")
+                            suppress_next_n_code_results -= 1
+                            last_part_was_python_code = False
+                            continue
+                    elif last_part_was_python_code:
+                        if "error" in output_text_lower or "traceback" in output_text_lower:
+                            logger.warning(f"Python code execution resulted in an error/traceback. Will display it: {output_text_lower[:100]}")
+                        else:
+                            logger.info("Displaying successful Python code execution result.")
+                    else:
+                        logger.warning(f"Encountered an unexpected code_execution_result, will display: {output_text_lower[:100]}")
+
+                parts_to_send_to_user.append(part_data)
+                if not current_part_is_python_code:
+                    last_part_was_python_code = False
+        else:
+            logger.warning("gemini_response_parts is empty, likely due to an initial error in response processing.")
+
 
         total_display_parts = len(parts_to_send_to_user)
         original_text_segments_for_fallback = [""] * total_display_parts
@@ -334,8 +366,9 @@ async def process_final_message(chat_id: int, context: CallbackContext):
                 current_original_text = part_data.text
                 try:
                     content_to_send = telegramify_markdown.markdownify(part_data.text)
+                    logger.info("Text part processed with telegramify.markdownify()")
                 except Exception as md_e:
-                    logger.error(f"Error with telegramify.markdownify for text part: {md_e}. Falling back to plain text for this part.")
+                    logger.error(f"Error with telegramify.markdownify for text part: {md_e}. Falling back to plain text.")
                     content_to_send = current_original_text
                     parse_mode_for_this_part = None
 
@@ -357,8 +390,8 @@ async def process_final_message(chat_id: int, context: CallbackContext):
                     img_data_bytes = getattr(part_data.inline_data, 'data', None)
                     if isinstance(img_data_bytes, bytes) and img_data_bytes:
                         image_to_send = {'data': img_data_bytes, 'mime_type': mime_type}
-                        logger.info(f"Extracted image data ({mime_type}, {len(img_data_bytes)} bytes) to send separately after text parts.")
-                        original_text_segments_for_fallback[part_idx] = "[Image will be sent separately]"
+                        logger.info(f"Extracted image data ({mime_type}, {len(img_data_bytes)} bytes) to send separately.")
+                        if part_idx < len(original_text_segments_for_fallback): original_text_segments_for_fallback[part_idx] = "[Image will be sent separately]"
                         continue
                     else:
                         logger.warning("Found inline_data image part but data is missing or not bytes.")
@@ -366,14 +399,18 @@ async def process_final_message(chat_id: int, context: CallbackContext):
                         current_original_text = "[Error processing image data]"
                 else:
                     logger.warning(f"Found inline_data part with non-image mime_type: {mime_type}. Skipping.")
-                    original_text_segments_for_fallback[part_idx] = f"[Skipped non-image inline_data: {mime_type}]"
+                    if part_idx < len(original_text_segments_for_fallback): original_text_segments_for_fallback[part_idx] = f"[Skipped non-image inline_data: {mime_type}]"
                     continue
             else:
                 logger.warning(f"Skipping unknown or empty part {part_idx+1}/{total_display_parts}")
-                original_text_segments_for_fallback[part_idx] = "[Skipped unknown/empty part]"
+                if part_idx < len(original_text_segments_for_fallback): original_text_segments_for_fallback[part_idx] = "[Skipped unknown/empty part]"
                 continue
 
-            original_text_segments_for_fallback[part_idx] = current_original_text
+            if part_idx < len(original_text_segments_for_fallback):
+                original_text_segments_for_fallback[part_idx] = current_original_text
+            else:
+                logger.error(f"Index out of bounds for original_text_segments_for_fallback. Part_idx: {part_idx}, Length: {len(original_text_segments_for_fallback)}")
+
 
             chunks_to_send_for_this_part = split_text(content_to_send, 4050)
             original_chunks_for_this_part_fallback = split_text(current_original_text, 4050)
@@ -381,7 +418,6 @@ async def process_final_message(chat_id: int, context: CallbackContext):
             for chunk_idx, text_chunk in enumerate(chunks_to_send_for_this_part):
                 is_last_chunk_of_this_api_part = (chunk_idx == len(chunks_to_send_for_this_part) - 1)
                 is_last_displayable_api_part = (part_idx == total_display_parts - 1)
-
                 current_chunk_is_last_overall = is_last_displayable_api_part and \
                                                  is_last_chunk_of_this_api_part and \
                                                  not image_to_send
@@ -392,19 +428,16 @@ async def process_final_message(chat_id: int, context: CallbackContext):
                     logger.info(f"Skipping empty sub-chunk {part_idx+1}-{chunk_idx+1} after stripping.")
                     continue
 
-                # Add (Part X of Y) indicator only if there are multiple *displayable* parts or sub-parts
                 if total_display_parts > 1 or len(chunks_to_send_for_this_part) > 1:
-                    part_indicator_text = f"{part_idx+1}"
+                    part_indicator_text = f"Segment {part_idx+1}"
                     if len(chunks_to_send_for_this_part) > 1:
                         part_indicator_text += f", sub-part {chunk_idx+1}/{len(chunks_to_send_for_this_part)}"
-                    part_indicator_text += f" of {total_display_parts}" # Clarified indicator
-
+                    part_indicator_text += f" of {total_display_parts} displayable segments"
                     escaped_indicator = f"\n\n_\\({part_indicator_text}\\)_" if parse_mode_for_this_part == "MarkdownV2" else f"\n\n({part_indicator_text})"
                     if len(final_text_chunk.encode('utf-8') if parse_mode_for_this_part == "MarkdownV2" else final_text_chunk) + \
                        len(escaped_indicator.encode('utf-8') if parse_mode_for_this_part == "MarkdownV2" else escaped_indicator) <= 4096:
                         final_text_chunk += escaped_indicator
-                    else:
-                        logger.warning("Chunk too long to add segment indicator.")
+                    else: logger.warning("Chunk too long to add segment indicator.")
 
                 try:
                     logger.info(f"Attempting to send segment {part_idx+1}-{chunk_idx+1} with parse_mode: {parse_mode_for_this_part}")
@@ -427,7 +460,6 @@ async def process_final_message(chat_id: int, context: CallbackContext):
                             if not plain_chunk_to_send:
                                 logger.info(f"Skipping empty plain text fallback for segment {part_idx+1}-{chunk_idx+1}.")
                                 continue
-
                             if total_display_parts > 1 or len(chunks_to_send_for_this_part) > 1:
                                 part_indicator_text = f"Segment {part_idx+1}"
                                 if len(chunks_to_send_for_this_part) > 1: part_indicator_text += f", sub-part {chunk_idx+1}/{len(chunks_to_send_for_this_part)}"
@@ -465,8 +497,8 @@ async def process_final_message(chat_id: int, context: CallbackContext):
                      try: await context.bot.send_message(chat_id=chat_id, text="😭 Sorry, there was an error sending the generated image.", reply_markup=get_new_conversation_keyboard())
                      except Exception: pass
 
-        if not sent_anything_successfully:
-             logger.error("Failed to send any part of the response.")
+        if not sent_anything_successfully and not (gemini_response_parts and hasattr(gemini_response_parts[0], 'text') and gemini_response_parts[0].text.startswith("Error:")) : # Avoid double error message if initial extraction failed
+             logger.error("Failed to send any part of the response, and it wasn't an initial error message.")
              try: await context.bot.send_message(chat_id=chat_id, text="😭 Sorry, there was an unexpected problem sending the response.", reply_markup=get_new_conversation_keyboard())
              except Exception: pass
 
@@ -680,4 +712,3 @@ def start_bot():
 
 if __name__ == '__main__':
         start_bot()
-
