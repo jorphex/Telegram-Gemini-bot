@@ -17,6 +17,7 @@ from telegram.ext import (
 from telegram.error import BadRequest, TelegramError
 import telegramify_markdown
 from telegramify_markdown.type import ContentTypes
+from telegramify_markdown.interpreters import TextInterpreter, InterpreterChain
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -61,7 +62,7 @@ FLASH_CONFIG = ModelConfig(
 
 PRO_CONFIG = ModelConfig(
     name="2.5 Pro",
-    model_id="gemini-2.5-pro-preview-05-06",
+    model_id="gemini-2.5-pro-preview-06-05",
     system_instruction=PRO_SYSTEM_INSTRUCTIONS,
     temperature=0.6,
     emoji="💡",
@@ -108,7 +109,7 @@ def get_new_conversation_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def split_text(text, max_length=4050):
+def split_text(text, max_length=4000):
     """
     Splits text into chunks <= max_length.
     Prioritizes splitting at double newlines (\n\n), then single newlines (\n).
@@ -183,7 +184,7 @@ def query_assistant(user_content: List[types.Part], chat: Any, config: ModelConf
         logger.error(f"Error calling Gemini API ({config.name}): {type(e).__name__} - {e}")
         return f"Error: An exception occurred while contacting the AI ({type(e).__name__}).", chat
 
-# --- Typing Indicator ---
+# --- Typing Indicator Helper ---
 async def keep_typing(context: CallbackContext, chat_id: int, stop_event: asyncio.Event):
     """Sends typing action periodically until stop_event is set."""
     while not stop_event.is_set():
@@ -200,322 +201,188 @@ async def keep_typing(context: CallbackContext, chat_id: int, stop_event: asynci
             logger.error(f"Unexpected error in keep_typing for {chat_id}: {e}")
             await asyncio.sleep(10)
 
+
+
+
+
 async def process_final_message(chat_id: int, context: CallbackContext):
-    """Processes the accumulated message after the debounce timer expires."""
+    """
+    Processes the final accumulated message, sends it to Gemini,
+    and handles the response, including text, code execution, generated files, and formatting.
+    """
     global conversation_threads, pending_content, debounce_timers, FLASH_CONFIG, DEFAULT_TOOLS
+    logger.info(f"Debounce timer expired for chat_id: {chat_id}. Processing message.")
 
-    logger.info(f"Debounce timer expired for chat_id: {chat_id}. Processing accumulated message.")
+    async with debounce_lock:
+        user_content_parts = pending_content.pop(chat_id, None)
+        if chat_id in debounce_timers:
+            del debounce_timers[chat_id]
 
-    user_content_parts = pending_content.get(chat_id)
     if not user_content_parts:
-        logger.warning(f"process_final_message called for chat_id {chat_id}, but no pending content found.")
-        async with debounce_lock:
-            if chat_id in debounce_timers: del debounce_timers[chat_id]
-            if chat_id in pending_content: del pending_content[chat_id]
+        logger.warning(f"process_final_message called for chat_id {chat_id}, but no content found.")
         return
 
-    # --- Conversation Setup ---
+    # --- Ensure Conversation Exists ---
     convo_state = conversation_threads.get(chat_id)
-    chat_instance = None
-    current_config = None
     if not convo_state or not convo_state.chat:
-        logger.info(f"No active conversation for chat_id: {chat_id}. Creating default ({FLASH_CONFIG.name}).")
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        stop_typing_event_setup = asyncio.Event(); typing_task_setup = asyncio.create_task(keep_typing(context, chat_id, stop_typing_event_setup))
-        default_chat_instance = None
-        try: default_chat_instance = await asyncio.to_thread(create_gemini_chat, FLASH_CONFIG, DEFAULT_TOOLS)
-        except Exception as create_e: logger.error(f"Error creating default Gemini chat ({FLASH_CONFIG.name}) in thread: {create_e}")
-        finally: stop_typing_event_setup.set(); await typing_task_setup
-        if default_chat_instance:
-            current_config = FLASH_CONFIG; chat_instance = default_chat_instance
-            conversation_threads[chat_id] = ConversationState(chat=chat_instance, config=current_config)
-            logger.info(f"Default conversation created successfully for chat_id: {chat_id} using {current_config.name}")
-        else:
-            logger.error(f"Failed to create default chat instance for chat_id: {chat_id}")
-            await context.bot.send_message(chat_id=chat_id, text="😭 Sorry, I couldn't start a conversation right now.")
-            async with debounce_lock:
-                if chat_id in debounce_timers: del debounce_timers[chat_id]
-                if chat_id in pending_content: del pending_content[chat_id]
-            return
-    else:
-        chat_instance = convo_state.chat
-        current_config = convo_state.config
-
-    # --- Log final combined message (user input) ---
-    log_display_parts = []
-    if user_content_parts:
-        for part in user_content_parts:
-            if part is None: log_display_parts.append("[None Part]"); continue
-            if hasattr(part, 'text') and part.text is not None:
-                try: text_snippet = part.text[:100]; ellipsis = '...' if len(part.text) > 100 else ''; log_display_parts.append(f"[Text]: {text_snippet}{ellipsis}")
-                except Exception as log_e: logger.error(f"Error logging text part content: {log_e}"); log_display_parts.append("[Text: Error logging content]")
-            elif hasattr(part, 'inline_data') and part.inline_data is not None:
-                try: mime_type = getattr(part.inline_data, 'mime_type', 'unknown'); data_len = len(getattr(part.inline_data, 'data', b'')); log_display_parts.append(f"[Inline Data]: mime_type={mime_type}, size={data_len} bytes")
-                except Exception as log_e: logger.error(f"Error logging inline_data part content: {log_e}"); log_display_parts.append("[Inline Data: Error logging content]")
-            elif hasattr(part, 'file_data') and part.file_data is not None:
-                try: mime_type = getattr(part.file_data, 'mime_type', 'unknown'); uri = getattr(part.file_data, 'file_uri', 'unknown'); log_display_parts.append(f"[File Data]: mime_type={mime_type}, uri={uri}")
-                except Exception as log_e: logger.error(f"Error logging file_data part content: {log_e}"); log_display_parts.append("[File Data: Error logging content]")
-            else: log_display_parts.append("[Unknown or Empty Part Structure]")
-    else: log_display_parts.append("[No Parts Found]")
-    user_content_log_display = " | ".join(log_display_parts)
-    logger.info(f"Final combined message for chat_id: {chat_id} (using model: {current_config.name}): {user_content_log_display}")
-
-
-    # --- Persistent Typing Indicator Logic ---
-    stop_typing_event = asyncio.Event()
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    typing_task = asyncio.create_task(keep_typing(context, chat_id, stop_typing_event))
-
-    image_to_send: Optional[Dict[str, Any]] = None
-    gemini_response_parts = []
-
-    try:
-        # --- Main Processing (API Call) ---
-        updated_chat = None
-        response_object_or_error = None
+        logger.info(f"No active conversation for {chat_id}. Creating default ({FLASH_CONFIG.name}).")
+        stop_typing_event_setup = asyncio.Event()
+        typing_task_setup = asyncio.create_task(keep_typing(context, chat_id, stop_typing_event_setup))
         try:
-            response_object_or_error, updated_chat = await asyncio.to_thread(
-                query_assistant, user_content_parts, chat_instance, current_config
-            )
-            if updated_chat: conversation_threads[chat_id].chat = updated_chat
-            else: logger.error(f"query_assistant returned None chat object for chat_id {chat_id}.")
-        except Exception as e:
-            logger.error(f"Error during query_assistant thread execution for chat_id {chat_id}: {e}")
-            response_object_or_error = f"Error: Exception during AI query ({type(e).__name__})."
-
-        # --- Extract Parts from Response Object or Error String ---
-        if isinstance(response_object_or_error, str):
-            logger.warning(f"Received error string from query_assistant: {response_object_or_error}")
-            gemini_response_parts = [types.Part(text=response_object_or_error)]
-        elif response_object_or_error and hasattr(response_object_or_error, 'candidates') and response_object_or_error.candidates:
-            logger.info("Extracting parts from Gemini response object.")
-            try:
-                gemini_response_parts = response_object_or_error.candidates[0].content.parts
-                logger.info(f"Found {len(gemini_response_parts)} parts in the response.")
-            except (AttributeError, IndexError, TypeError) as e:
-                 logger.error(f"Could not extract parts from response object: {e}")
-                 gemini_response_parts = [types.Part(text="Error: Could not read AI response structure.")]
-        else:
-            logger.error(f"Invalid response object or error received from query_assistant: {type(response_object_or_error)}")
-            gemini_response_parts = [types.Part(text="Error: Received invalid response from AI.")]
-
-        # --- Process and Send Each Part Individually ---
-        sent_anything_successfully = False
-        parts_to_send_to_user = []
-        suppress_next_n_code_results = 0
-        last_part_was_python_code = False
-
-        # This loop should only run if gemini_response_parts is not empty
-        if gemini_response_parts:
-            for i, part_data in enumerate(gemini_response_parts):
-                is_search_tool_call = False
-                current_part_is_python_code = False
-
-                if hasattr(part_data, 'executable_code') and part_data.executable_code and hasattr(part_data.executable_code, 'code'):
-                    code = part_data.executable_code.code.strip()
-                    if "search(" in code or "google_search(" in code or "concise_search(" in code:
-                        logger.info(f"Detected search tool call, flagging for suppression: {code}")
-                        is_search_tool_call = True
-                        suppress_next_n_code_results = code.count("search(") + code.count("google_search(") + code.count("concise_search(")
-                        if suppress_next_n_code_results == 0: suppress_next_n_code_results = 1
-                        logger.info(f"Will attempt to suppress next {suppress_next_n_code_results} code_execution_result parts related to search.")
-                        last_part_was_python_code = False
-                        continue
-                    else:
-                        current_part_is_python_code = True
-                        last_part_was_python_code = True
-
-                if hasattr(part_data, 'code_execution_result'):
-                    output_text_lower = getattr(getattr(part_data, 'code_execution_result', None), 'output', "").strip().lower()
-                    if suppress_next_n_code_results > 0:
-                        if "looking up information" in output_text_lower or "searching google" in output_text_lower:
-                            logger.info(f"Suppressing search tool 'looking up' result. Results to skip remaining: {suppress_next_n_code_results-1}")
-                            suppress_next_n_code_results -= 1
-                            last_part_was_python_code = False
-                            continue
-                        else:
-                            logger.info(f"Suppressing other code_execution_result after search. Results to skip remaining: {suppress_next_n_code_results-1}")
-                            suppress_next_n_code_results -= 1
-                            last_part_was_python_code = False
-                            continue
-                    elif last_part_was_python_code:
-                        if "error" in output_text_lower or "traceback" in output_text_lower:
-                            logger.warning(f"Python code execution resulted in an error/traceback. Will display it: {output_text_lower[:100]}")
-                        else:
-                            logger.info("Displaying successful Python code execution result.")
-                    else:
-                        logger.warning(f"Encountered an unexpected code_execution_result, will display: {output_text_lower[:100]}")
-
-                parts_to_send_to_user.append(part_data)
-                if not current_part_is_python_code:
-                    last_part_was_python_code = False
-        else:
-            logger.warning("gemini_response_parts is empty, likely due to an initial error in response processing.")
-
-
-        total_display_parts = len(parts_to_send_to_user)
-        original_text_segments_for_fallback = [""] * total_display_parts
-
-        for part_idx, part_data in enumerate(parts_to_send_to_user):
-            content_to_send = ""
-            current_original_text = ""
-            parse_mode_for_this_part = "MarkdownV2"
-
-            if hasattr(part_data, 'text') and part_data.text:
-                logger.info(f"Processing TEXT part {part_idx+1}/{total_display_parts}")
-                current_original_text = part_data.text
-                try:
-                    content_to_send = telegramify_markdown.markdownify(part_data.text)
-                    logger.info("Text part processed with telegramify.markdownify()")
-                except Exception as md_e:
-                    logger.error(f"Error with telegramify.markdownify for text part: {md_e}. Falling back to plain text.")
-                    content_to_send = current_original_text
-                    parse_mode_for_this_part = None
-
-            elif hasattr(part_data, 'executable_code') and part_data.executable_code and hasattr(part_data.executable_code, 'code'):
-                logger.info(f"Processing EXECUTABLE_CODE part {part_idx+1}/{total_display_parts}")
-                code = part_data.executable_code.code.strip()
-                current_original_text = code
-                content_to_send = f"```python\n{code}\n```"
-
-            elif hasattr(part_data, 'code_execution_result') and part_data.code_execution_result and hasattr(part_data.code_execution_result, 'output'):
-                logger.info(f"Processing CODE_EXECUTION_RESULT part {part_idx+1}/{total_display_parts}")
-                output = part_data.code_execution_result.output.strip()
-                current_original_text = f"Output:\n{output}"
-                content_to_send = f"**Output:**\n```\n{output}\n```"
-
-            elif hasattr(part_data, 'inline_data') and part_data.inline_data and hasattr(part_data.inline_data, 'data'):
-                mime_type = getattr(part_data.inline_data, 'mime_type', '')
-                if mime_type.startswith('image/'):
-                    img_data_bytes = getattr(part_data.inline_data, 'data', None)
-                    if isinstance(img_data_bytes, bytes) and img_data_bytes:
-                        image_to_send = {'data': img_data_bytes, 'mime_type': mime_type}
-                        logger.info(f"Extracted image data ({mime_type}, {len(img_data_bytes)} bytes) to send separately.")
-                        if part_idx < len(original_text_segments_for_fallback): original_text_segments_for_fallback[part_idx] = "[Image will be sent separately]"
-                        continue
-                    else:
-                        logger.warning("Found inline_data image part but data is missing or not bytes.")
-                        content_to_send = "_[Error processing image data]_"
-                        current_original_text = "[Error processing image data]"
-                else:
-                    logger.warning(f"Found inline_data part with non-image mime_type: {mime_type}. Skipping.")
-                    if part_idx < len(original_text_segments_for_fallback): original_text_segments_for_fallback[part_idx] = f"[Skipped non-image inline_data: {mime_type}]"
-                    continue
+            default_chat_instance = await asyncio.to_thread(create_gemini_chat, FLASH_CONFIG, DEFAULT_TOOLS)
+            if default_chat_instance:
+                convo_state = ConversationState(chat=default_chat_instance, config=FLASH_CONFIG)
+                conversation_threads[chat_id] = convo_state
+                logger.info(f"Default conversation created for {chat_id} using {FLASH_CONFIG.name}")
             else:
-                logger.warning(f"Skipping unknown or empty part {part_idx+1}/{total_display_parts}")
-                if part_idx < len(original_text_segments_for_fallback): original_text_segments_for_fallback[part_idx] = "[Skipped unknown/empty part]"
-                continue
+                raise Exception("Failed to create default chat instance.")
+        except Exception as create_e:
+            logger.error(f"Failed to create default chat for {chat_id}: {create_e}")
+            await context.bot.send_message(chat_id=chat_id, text="😭 Sorry, I couldn't start a conversation right now.")
+            return
+        finally:
+            stop_typing_event_setup.set()
+            await typing_task_setup
+    
+    chat_instance = convo_state.chat
+    current_config = convo_state.config
+    
+    # --- Send to Gemini and Get Response ---
+    stop_typing_event = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(context, chat_id, stop_typing_event))
+    
+    response_object = None
+    error_message = ""
+    try:
+        logger.info(f"Sending {len(user_content_parts)} parts to Gemini for chat_id: {chat_id}")
+        response_object, updated_chat = await asyncio.to_thread(
+            query_assistant, user_content_parts, chat_instance, current_config
+        )
+        if updated_chat:
+            conversation_threads[chat_id].chat = updated_chat
+        if isinstance(response_object, str):
+             error_message = response_object
+             response_object = None
 
-            if part_idx < len(original_text_segments_for_fallback):
-                original_text_segments_for_fallback[part_idx] = current_original_text
-            else:
-                logger.error(f"Index out of bounds for original_text_segments_for_fallback. Part_idx: {part_idx}, Length: {len(original_text_segments_for_fallback)}")
-
-
-            chunks_to_send_for_this_part = split_text(content_to_send, 4050)
-            original_chunks_for_this_part_fallback = split_text(current_original_text, 4050)
-
-            for chunk_idx, text_chunk in enumerate(chunks_to_send_for_this_part):
-                is_last_chunk_of_this_api_part = (chunk_idx == len(chunks_to_send_for_this_part) - 1)
-                is_last_displayable_api_part = (part_idx == total_display_parts - 1)
-                current_chunk_is_last_overall = is_last_displayable_api_part and \
-                                                 is_last_chunk_of_this_api_part and \
-                                                 not image_to_send
-                reply_markup = get_new_conversation_keyboard() if current_chunk_is_last_overall else None
-
-                final_text_chunk = text_chunk.strip()
-                if not final_text_chunk:
-                    logger.info(f"Skipping empty sub-chunk {part_idx+1}-{chunk_idx+1} after stripping.")
-                    continue
-
-                if total_display_parts > 1 or len(chunks_to_send_for_this_part) > 1:
-                    part_indicator_text = f"Segment {part_idx+1}"
-                    if len(chunks_to_send_for_this_part) > 1:
-                        part_indicator_text += f", sub-part {chunk_idx+1}/{len(chunks_to_send_for_this_part)}"
-                    part_indicator_text += f" of {total_display_parts} displayable segments"
-                    escaped_indicator = f"\n\n_\\({part_indicator_text}\\)_" if parse_mode_for_this_part == "MarkdownV2" else f"\n\n({part_indicator_text})"
-                    if len(final_text_chunk.encode('utf-8') if parse_mode_for_this_part == "MarkdownV2" else final_text_chunk) + \
-                       len(escaped_indicator.encode('utf-8') if parse_mode_for_this_part == "MarkdownV2" else escaped_indicator) <= 4096:
-                        final_text_chunk += escaped_indicator
-                    else: logger.warning("Chunk too long to add segment indicator.")
-
-                try:
-                    logger.info(f"Attempting to send segment {part_idx+1}-{chunk_idx+1} with parse_mode: {parse_mode_for_this_part}")
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=final_text_chunk,
-                        parse_mode=parse_mode_for_this_part,
-                        reply_markup=reply_markup,
-                        disable_web_page_preview=True
-                    )
-                    sent_anything_successfully = True
-                    logger.info(f"Sent segment {part_idx+1}-{chunk_idx+1}.")
-                except BadRequest as e:
-                    if "can't parse entities" in str(e).lower() or "unclosed" in str(e).lower() or "nested" in str(e).lower():
-                        logger.warning(f"MarkdownV2 failed for segment {part_idx+1}-{chunk_idx+1}: {e}. Retrying as plain text.")
-                        try:
-                            plain_chunk_to_send = (original_chunks_for_this_part_fallback[chunk_idx]
-                                                   if chunk_idx < len(original_chunks_for_this_part_fallback)
-                                                   else text_chunk).strip()
-                            if not plain_chunk_to_send:
-                                logger.info(f"Skipping empty plain text fallback for segment {part_idx+1}-{chunk_idx+1}.")
-                                continue
-                            if total_display_parts > 1 or len(chunks_to_send_for_this_part) > 1:
-                                part_indicator_text = f"Segment {part_idx+1}"
-                                if len(chunks_to_send_for_this_part) > 1: part_indicator_text += f", sub-part {chunk_idx+1}/{len(chunks_to_send_for_this_part)}"
-                                part_indicator_text += f" of {total_display_parts} displayable segments"
-                                indicator = f"\n\n({part_indicator_text})"
-                                if len(plain_chunk_to_send) + len(indicator) <= 4096: plain_chunk_to_send += indicator
-                            if len(plain_chunk_to_send) > 4096: plain_chunk_to_send = plain_chunk_to_send[:4090] + "...]"
-                            await context.bot.send_message(chat_id=chat_id, text=plain_chunk_to_send, reply_markup=reply_markup, disable_web_page_preview=True)
-                            sent_anything_successfully = True
-                            logger.info(f"Sent segment {part_idx+1}-{chunk_idx+1} as plain text fallback.")
-                        except Exception as plain_e:
-                            logger.error(f"Error sending segment {part_idx+1}-{chunk_idx+1} as plain text fallback: {plain_e}")
-                    else:
-                        logger.error(f"Error sending segment {part_idx+1}-{chunk_idx+1} (BadRequest, not parsing): {e}")
-                except Exception as e:
-                    logger.error(f"Error sending segment {part_idx+1}-{chunk_idx+1}: {e}")
-
-                if len(chunks_to_send_for_this_part) > 1 and chunk_idx < len(chunks_to_send_for_this_part) -1 :
-                    await asyncio.sleep(0.2)
-            if total_display_parts > 1 and part_idx < total_display_parts - 1:
-                await asyncio.sleep(0.3)
-
-        # --- Send Extracted Image (if any) ---
-        if image_to_send:
-            logger.info(f"Attempting to send extracted image data.")
-            image_reply_markup = get_new_conversation_keyboard()
-            image_caption = image_to_send.get('caption', None)
-            try:
-                await context.bot.send_photo(chat_id=chat_id, photo=image_to_send['data'], caption=image_caption, reply_markup=image_reply_markup)
-                logger.info(f"Successfully sent extracted image.")
-                sent_anything_successfully = True
-            except Exception as img_e:
-                logger.error(f"Error sending extracted image: {img_e}")
-                if not sent_anything_successfully:
-                     try: await context.bot.send_message(chat_id=chat_id, text="😭 Sorry, there was an error sending the generated image.", reply_markup=get_new_conversation_keyboard())
-                     except Exception: pass
-
-        if not sent_anything_successfully and not (gemini_response_parts and hasattr(gemini_response_parts[0], 'text') and gemini_response_parts[0].text.startswith("Error:")) : # Avoid double error message if initial extraction failed
-             logger.error("Failed to send any part of the response, and it wasn't an initial error message.")
-             try: await context.bot.send_message(chat_id=chat_id, text="😭 Sorry, there was an unexpected problem sending the response.", reply_markup=get_new_conversation_keyboard())
-             except Exception: pass
-
+    except Exception as e:
+        logger.error(f"Exception during Gemini query for {chat_id}: {e}")
+        error_message = f"Error: An exception occurred while contacting the AI ({type(e).__name__})."
     finally:
-        # --- Stop the Typing Indicator & Cleanup ---
+        # Clean up user-uploaded files
+        for part in user_content_parts:
+            if hasattr(part, 'name') and isinstance(part.name, str) and part.name.startswith("files/"):
+                try:
+                    await asyncio.to_thread(client.files.delete, name=part.name)
+                    logger.info(f"Deleted user file from File API: {part.name}")
+                except Exception as delete_e:
+                    logger.error(f"Failed to delete user file {part.name}: {delete_e}")
         stop_typing_event.set()
         await typing_task
-        logger.debug(f"Typing indicator task finished for chat_id: {chat_id}")
-        async with debounce_lock:
-            if chat_id in debounce_timers and debounce_timers[chat_id].done(): del debounce_timers[chat_id]
-            if chat_id in pending_content: del pending_content[chat_id]
-        logger.info(f"Cleaned up debounce state for chat_id: {chat_id}")
+
+    # --- Manually Process Response Parts ---
+    full_response_text = ""
+    files_to_send = []
+    
+    if error_message:
+        full_response_text = error_message
+    elif response_object and hasattr(response_object, 'candidates') and response_object.candidates:
+        response_parts = response_object.candidates[0].content.parts
+        logger.info(f"Received {len(response_parts)} parts from Gemini. Processing...")
+        text_parts_for_markdown = []
+        
+        for i, part in enumerate(response_parts):
+            if part.text:
+                logger.info(f"Part {i+1}: Found text part.")
+                text_parts_for_markdown.append(part.text)
+            
+            if part.executable_code:
+                logger.info(f"Part {i+1}: Found executable_code part.")
+                code = part.executable_code.code
+                text_parts_for_markdown.append(f"```python\n{code}\n```")
+            
+            if part.code_execution_result:
+                logger.info(f"Part {i+1}: Found code_execution_result part.")
+                if hasattr(part.code_execution_result, 'output') and part.code_execution_result.output:
+                    output = part.code_execution_result.output
+                    text_parts_for_markdown.append(f"**Output:**\n```\n{output}\n```")
+            
+            if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                logger.info(f"Part {i+1}: Found inline_data part (a generated file).")
+                file_data = part.inline_data
+                file_name = f"output.{file_data.mime_type.split('/')[-1]}"
+                files_to_send.append({'data': file_data.data, 'mime_type': file_data.mime_type, 'name': file_name})
+                logger.info(f"Extracted generated file: {file_name} ({file_data.mime_type})")
+        
+        full_response_text = "\n\n".join(text_parts_for_markdown)
+    else:
+        full_response_text = "Error: Received an invalid or empty response from the AI."
+        logger.error(f"Invalid response object received for chat_id {chat_id}: {response_object}")
+
+    if not full_response_text.strip() and not files_to_send:
+        logger.warning(f"Gemini returned an empty response for chat_id: {chat_id}")
+        full_response_text = "I received your message but didn't have anything to add!"
+
+    # --- Send Formatted Text Messages ---
+    sent_text_successfully = False
+    if full_response_text.strip():
+        logger.info("Preparing to send formatted text to user.")
+        try:
+            text_only_interpreter = InterpreterChain([TextInterpreter()])
+            message_boxes = await telegramify_markdown.telegramify(
+                full_response_text,
+                interpreters_use=text_only_interpreter,
+                max_word_count=4050
+            )
+            total_boxes = len(message_boxes)
+            logger.info(f"Telegramify split text into {total_boxes} message(s).")
+            for i, box in enumerate(message_boxes):
+                is_last_box = (i == total_boxes - 1) and not files_to_send
+                reply_markup = get_new_conversation_keyboard() if is_last_box else None
+                try:
+                    await context.bot.send_message(chat_id, box.content, parse_mode="MarkdownV2", reply_markup=reply_markup, disable_web_page_preview=True)
+                    sent_text_successfully = True
+                except BadRequest as e:
+                    if "can't parse entities" in str(e).lower():
+                        logger.warning(f"MarkdownV2 failed for a chunk: {e}. Retrying as code block.")
+                        fallback_text = f"```\n{box.content}\n```"
+                        await context.bot.send_message(chat_id, fallback_text, parse_mode="MarkdownV2", reply_markup=reply_markup, disable_web_page_preview=True)
+                        sent_text_successfully = True
+                    else: raise e
+                if not is_last_box: await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"Fatal error in telegramify processing or sending loop for {chat_id}: {e}")
+            await context.bot.send_message(chat_id, "😭 A critical error occurred while formatting my response.", reply_markup=get_new_conversation_keyboard())
+
+    # --- Send Extracted Files ---
+    if files_to_send:
+        total_files = len(files_to_send)
+        logger.info(f"Found {total_files} generated file(s) to send.")
+        for i, file_info in enumerate(files_to_send):
+            is_last_file = (i == total_files - 1)
+            reply_markup = get_new_conversation_keyboard() if is_last_file else None
+            file_to_send_obj = BytesIO(file_info['data'])
+            file_to_send_obj.name = file_info['name']
+            try:
+                mime_type = file_info['mime_type']
+                caption = f"Generated file: `{file_info['name']}`"
+                logger.info(f"Sending file {i+1}/{total_files}: {file_info['name']}")
+                if mime_type.startswith('image/'):
+                    await context.bot.send_photo(chat_id, photo=file_to_send_obj, caption=caption, parse_mode="MarkdownV2", reply_markup=reply_markup)
+                else:
+                    await context.bot.send_document(chat_id, document=file_to_send_obj, filename=file_info['name'], caption=caption, parse_mode="MarkdownV2", reply_markup=reply_markup)
+            except Exception as e:
+                logger.error(f"Failed to send generated file {file_info['name']} to {chat_id}: {e}")
+                if not sent_text_successfully and i == 0:
+                    await context.bot.send_message(chat_id, f"😭 Error sending generated file: {file_info['name']}", reply_markup=get_new_conversation_keyboard())
+            if not is_last_file: await asyncio.sleep(0.3)
+    else:
+        logger.info("No generated files found in the response.")
+
 
             
 # --- TELEGRAM ---
 async def handle_message(update: Update, context: CallbackContext):
-    """Handles incoming messages, accumulates them with debouncing, and triggers processing."""
+    """Handles incoming messages, including text, photos, documents (PDFs), and YouTube URLs."""
     global conversation_threads, debounce_timers, pending_content, debounce_lock, MAX_DEBOUNCE_PARTS, FLASH_CONFIG
 
     if not update.message:
@@ -525,9 +392,9 @@ async def handle_message(update: Update, context: CallbackContext):
     chat_id = update.message.chat.id
     message_id = update.message.message_id
 
-    # --- Process User Input into a list of Parts ---
     current_message_parts: List[types.Part] = []
     input_processed = False
+    user_prompt_for_media = ""
 
     youtube_pattern = r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+(?:[?&]\S*)?)'
 
@@ -535,18 +402,62 @@ async def handle_message(update: Update, context: CallbackContext):
         if update.message.photo:
             photo = update.message.photo[-1]; photo_file = await photo.get_file()
             photo_bytes_io = BytesIO(); await photo_file.download_to_memory(photo_bytes_io); photo_bytes_io.seek(0)
-            img_part = types.Part.from_bytes(data=photo_bytes_io.getvalue(), mime_type='image/jpeg')
-            if update.message.caption: current_message_parts.append(types.Part(text=update.message.caption))
+            img_part = types.Part.from_bytes(data=photo_bytes_io.getvalue(), mime_type='image/jpeg') # Assuming JPEG
+            user_prompt_for_media = update.message.caption if update.message.caption else "Describe this image."
+            current_message_parts.append(types.Part(text=user_prompt_for_media))
             current_message_parts.append(img_part)
             logger.info(f"Processing image (caption: {bool(update.message.caption)}) for chat_id: {chat_id}")
             input_processed = True
 
+        elif update.message.document:
+            doc = update.message.document
+            if doc.mime_type == 'application/pdf':
+                logger.info(f"Received PDF document: {doc.file_name} (Size: {doc.file_size} bytes)")
+                pdf_file = await doc.get_file()
+                pdf_bytes_io = BytesIO()
+                await pdf_file.download_to_memory(pdf_bytes_io)
+                pdf_bytes_io.seek(0)
+                pdf_data = pdf_bytes_io.getvalue()
+
+                # Threshold for using File API (e.g., 19MB to be safe for 20MB request limit)
+                FILE_API_THRESHOLD = 19 * 1024 * 1024
+
+                pdf_part = None
+                if doc.file_size < FILE_API_THRESHOLD:
+                    logger.info(f"PDF size ({doc.file_size} bytes) is under threshold. Using inline data.")
+                    pdf_part = types.Part.from_bytes(data=pdf_data, mime_type='application/pdf')
+                else:
+                    logger.info(f"PDF size ({doc.file_size} bytes) exceeds threshold. Using File API.")
+                    try:
+                        uploaded_file = await asyncio.to_thread(
+                            client.files.upload,
+                            file=BytesIO(pdf_data),
+                            config=types.FileConfig(mime_type='application/pdf', display_name=doc.file_name)
+                        )
+                        pdf_part = uploaded_file
+                        logger.info(f"Successfully uploaded PDF to File API: {uploaded_file.name}")
+                    except Exception as upload_e:
+                        logger.error(f"Error uploading PDF to File API: {upload_e}")
+                        await context.bot.send_message(chat_id=chat_id, text="Error: Could not process the large PDF via File API.", reply_to_message_id=message_id)
+                        return
+
+                if pdf_part:
+                    user_prompt_for_media = update.message.caption if update.message.caption else "Summarize this document."
+                    current_message_parts.append(types.Part(text=user_prompt_for_media))
+                    current_message_parts.append(pdf_part)
+                    input_processed = True
+            else:
+                logger.info(f"Received document of unsupported type: {doc.mime_type}. Skipping.")
+                await context.bot.send_message(chat_id=chat_id, text=f"Sorry, I can only process PDF documents, not {doc.mime_type}.", reply_to_message_id=message_id)
+                return
+
+
         elif update.message.text:
             message_text = update.message.text
             youtube_match = re.search(youtube_pattern, message_text)
+
             if youtube_match:
-                youtube_url = youtube_match.group(1)
-                logger.info(f"Detected YouTube URL: {youtube_url} in message from chat_id: {chat_id}")
+                youtube_url = youtube_match.group(1); logger.info(f"Detected YouTube URL: {youtube_url} in message from chat_id: {chat_id}")
                 text_before_url = message_text[:youtube_match.start()].strip()
                 if text_before_url: current_message_parts.append(types.Part(text=text_before_url))
                 current_message_parts.append(types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url)))
@@ -558,7 +469,7 @@ async def handle_message(update: Update, context: CallbackContext):
                 current_message_parts.append(types.Part(text=message_text))
                 input_processed = True
         else:
-            logger.info(f"Message {message_id} from chat_id: {chat_id} has no processable text or photo. Skipping.")
+            logger.info(f"Message {message_id} from chat_id: {chat_id} has no processable content. Skipping.")
             return
 
     except Exception as e:
@@ -570,8 +481,8 @@ async def handle_message(update: Update, context: CallbackContext):
          logger.warning(f"Input processing finished for chat_id {chat_id}, message {message_id}, but resulted in no content parts. Skipping.")
          return
 
-    # --- Debounce ---
-    DEBOUNCE_DELAY = 1.0 # seconds
+    # --- Debounce Logic ---
+    DEBOUNCE_DELAY = 0.5 # seconds
 
     async with debounce_lock:
         existing_task = debounce_timers.get(chat_id)
@@ -580,32 +491,38 @@ async def handle_message(update: Update, context: CallbackContext):
         if existing_task:
             logger.debug(f"Debounce timer active for chat_id: {chat_id}. Cancelling previous task.")
             existing_task.cancel()
-
             if chat_id in pending_content:
-                if len(pending_content[chat_id]) >= MAX_DEBOUNCE_PARTS:
-                    logger.warning(f"Max debounce parts ({MAX_DEBOUNCE_PARTS}) reached for chat_id {chat_id}. Ignoring latest message part(s).")
+                if len(pending_content[chat_id]) + len(current_message_parts) > MAX_DEBOUNCE_PARTS:
+                    logger.warning(f"Max debounce parts ({MAX_DEBOUNCE_PARTS}) would be exceeded for chat_id {chat_id}. Ignoring latest message part(s).")
                     accumulated_parts_count = len(pending_content[chat_id])
                 else:
-                    can_merge = (
+                    can_merge_text = (
                         len(current_message_parts) == 1 and hasattr(current_message_parts[0], 'text') and
-                        pending_content[chat_id] and hasattr(pending_content[chat_id][-1], 'text')
+                        not any(hasattr(p, 'inline_data') or hasattr(p, 'file_data') for p in current_message_parts) and
+                        pending_content[chat_id] and
+                        len(pending_content[chat_id]) > 0 and
+                        hasattr(pending_content[chat_id][-1], 'text') and
+                        not any(hasattr(p, 'inline_data') or hasattr(p, 'file_data') for p in [pending_content[chat_id][-1]])
                     )
 
-                    if can_merge:
+                    if can_merge_text:
                         last_text_part = pending_content[chat_id][-1]
                         new_text = current_message_parts[0].text
-                        last_text_part.text = f"{last_text_part.text}\n{new_text}"
+                        if last_text_part.text == user_prompt_for_media and user_prompt_for_media:
+                             last_text_part.text = f"{last_text_part.text} {new_text}"
+                             logger.info(f"Appended text to existing media prompt for chat_id: {chat_id}.")
+                        else:
+                             last_text_part.text = f"{last_text_part.text}\n{new_text}"
+                             logger.info(f"Merged text message into pending content for chat_id: {chat_id}.")
                         accumulated_parts_count = len(pending_content[chat_id])
-                        logger.info(f"Merged text message into pending content for chat_id: {chat_id}. Total parts: {accumulated_parts_count}")
                     else:
                         pending_content[chat_id].extend(current_message_parts)
                         accumulated_parts_count = len(pending_content[chat_id])
-                        logger.info(f"Appended message part(s) to pending content for chat_id: {chat_id}. Total parts: {accumulated_parts_count}")
+                        logger.info(f"Appended new part(s) (media or text) to pending content for chat_id: {chat_id}. Total parts: {accumulated_parts_count}")
             else:
                 logger.warning(f"Debounce task existed for chat_id {chat_id}, but no pending content found. Starting fresh.")
                 pending_content[chat_id] = current_message_parts
                 accumulated_parts_count = len(pending_content[chat_id])
-
         else:
             logger.info(f"Starting new debounce timer ({DEBOUNCE_DELAY}s) for chat_id: {chat_id}.")
             pending_content[chat_id] = current_message_parts
@@ -704,7 +621,13 @@ def start_bot():
 
     application.add_handler(CallbackQueryHandler(start_new_conversation_callback, pattern=f"^{FLASH_CONFIG.callback_data}$"))
     application.add_handler(CallbackQueryHandler(start_new_conversation_callback, pattern=f"^{PRO_CONFIG.callback_data}$"))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) | filters.PHOTO & (~filters.COMMAND), handle_message))
+
+    application.add_handler(MessageHandler(
+        filters.TEXT & (~filters.COMMAND) |
+        filters.PHOTO & (~filters.COMMAND) |
+        filters.Document.PDF & (~filters.COMMAND),
+        handle_message
+    ))
 
     logger.info("Bot is running... Waiting for messages.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
